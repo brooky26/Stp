@@ -410,11 +410,15 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # to improve models but the broken Hurst meant it was calibrating on corrupted
 # features. Use scheduled 2-hour recal only — sufficient for synthetics.
 POST_LOSS_DEEP_RECAL = False
-# CHANGED: durations are now specified in MINUTES, not ticks. Same numeric
-# spread as before (1/3/5/7/10) but now means 1-10 minute holds instead of
-# 1-10 tick holds — a much longer horizon. Retune this list if you want the
-# original "fast scalp" feel (e.g. [1, 2, 3, 5] minutes).
-CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]  # minutes
+# CHANGED (back): durations are specified in TICKS again, not minutes.
+# Same numeric spread as the original scalp build (1/3/5/7/10) but this now
+# means 1-10 TICK holds — Deriv's tick-contract duration_unit ("t") — rather
+# than 1-10 MINUTE holds. This is a much shorter horizon than the v4 minute
+# build, so monte_carlo_duration()'s terminal-displacement math no longer
+# needs a ticks-per-minute conversion: each candidate IS the tick count used
+# directly in the sqrt(ticks) scaling. Retune this list to widen/narrow the
+# scan (e.g. [1, 2, 3, 4, 5] for an even faster scalp).
+CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]  # ticks
 
 # FIX v4: shrinkage strength (in pseudo-observations) applied to each
 # duration bucket's empirical win rate in monte_carlo_duration(). A bucket
@@ -486,6 +490,46 @@ TICKS_PER_MIN_DEFAULT    = 60         # fallback tick rate if symbol history is 
 # distinguish 0.52 from 0.51 with high confidence. This reduces calibration
 # time by ~80% while retaining statistical validity.
 MC_SIMULATIONS = 8000
+
+# ── MC ENSEMBLE (LAYER 12 expansion) ──────────────────────────────────────
+# monte_carlo_duration() no longer relies on a single parametric-Gaussian
+# terminal-displacement model. It now runs FIVE independent estimators per
+# candidate duration and combines them:
+#   1. Gaussian terminal displacement   (original parametric model)
+#   2. Student-t terminal displacement  (fat tails, df fitted from live kurtosis)
+#   3. Block-bootstrap resampling       (model-free, uses actual return history)
+#   4. Jump-diffusion overlay           (Merton-style, driven by the L18 jump layer)
+#   5. Regime-mixture simulation        (Bernoulli mixture of trend vs. mean-
+#                                         reversion paths, weighted by trend_weight,
+#                                         instead of blending the two into one mean)
+# Secondary estimators use a fraction of MC_SIMULATIONS since they mainly need
+# to establish directional agreement/disagreement with the primary Gaussian
+# estimate, not the same tight standard error.
+MC_ENSEMBLE_SUB_SIMULATIONS = max(1000, MC_SIMULATIONS // 2)
+
+# Ensemble weights — Gaussian still leads (it's the cheapest/best-understood),
+# bootstrap is weighted second-highest because it makes no distributional
+# assumption at all, and the remaining three each contribute a distinct
+# failure mode the others can't see (fat tails, jump risk, regime bimodality).
+MC_ENSEMBLE_WEIGHTS = {
+    "gaussian":       0.30,
+    "bootstrap":      0.20,
+    "student_t":      0.20,
+    "jump_diffusion": 0.15,
+    "regime_mixture": 0.15,
+}
+
+# FIX (MC expansion): the old meta_ensemble_agrees()/bootstrap_mc_p_directional
+# pairing computed a 2-way parametric-vs-bootstrap disagreement check but was
+# never actually wired into monte_carlo_duration() — it sat dead in the file.
+# Generalised here to all 5 ensemble members: the more the independent
+# estimators disagree with each other, the less any single number among them
+# should be trusted, so disagreement shrinks the combined estimate toward 0.5
+# before the empirical Beta-shrinkage blend is even applied. This is a second,
+# earlier line of defence against the same failure mode FIX v4 addressed for
+# small-sample empirical buckets (an apparently sharp edge is not the same
+# thing as a well-evidenced one).
+ENSEMBLE_DISAGREEMENT_PENALTY = 2.5   # higher = more punishing per unit of std-dev spread across methods
 
 WATCHDOG_TIMEOUT = 5 * 60
 WATCHDOG_CHECK_INTERVAL = 20
@@ -654,7 +698,7 @@ class SupabaseStore:
             "barrier_sigma": notouch_entry["sigma"]               if notouch_entry else None,
             "p_no_touch":    round(notouch_entry["p_no_touch"],6) if notouch_entry else None,
             "nt_ev":         round(notouch_entry["ev"], 6)        if notouch_entry else None,
-            "dur_unit":      notouch_entry["dur_unit"]            if notouch_entry else "m",
+            "dur_unit":      notouch_entry["dur_unit"]            if notouch_entry else "t",
         }
         self._insert("bot_trade_log", row)
 
@@ -3349,30 +3393,148 @@ def autotune_gates(state):
 
 
 # ---------------------------------------------------------------------------
-# LAYER 12: MONTE CARLO DURATION SELECTOR
+# LAYER 12: MONTE CARLO DURATION SELECTOR — 5-METHOD ENSEMBLE
 # ---------------------------------------------------------------------------
-def monte_carlo_duration(prices, returns, direction, feats, candidate_durations, n_sims=MC_SIMULATIONS, models=None, tpm=None):
+# The functions below are the individual ensemble members that
+# monte_carlo_duration() combines. Splitting them out (rather than one long
+# inline loop) makes each statistical assumption explicit and independently
+# testable/tunable.
+
+def _mc_gaussian_terminal(direction, mean_disp, vol, dur_ticks, n_sims):
+    """Method 1 — parametric Gaussian terminal displacement (the original
+    model). Deriv Rise/Fall settles on price[expiry] vs price[entry], so the
+    correct object to sample is the TERMINAL displacement after `dur_ticks`
+    independent ticks:
+
+        X_T ~ N(mean_disp * dur_ticks, vol * sqrt(dur_ticks))
+
+    Returns (weighted_win_rate, batch_std_error). The batch standard error is
+    computed by splitting the n_sims draws into independent sub-batches and
+    taking the std of their win rates — an honest, resampling-free estimate
+    of how noisy this single method's reading is, used later to size the
+    ensemble-disagreement penalty."""
+    terminal = np.random.normal(mean_disp * dur_ticks, vol * np.sqrt(dur_ticks), size=n_sims)
+    wins = np.sum(terminal > 0) if direction > 0 else np.sum(terminal < 0)
+    sim_win_rate = wins / n_sims
+
+    # FIX v2: Magnitude-weighted win rate. A naive win-count treats a path
+    # that ends barely past zero the same as one that ends far in favour of
+    # the direction. Weighting by |terminal|/std down-weights borderline
+    # crossings for a sharper, more honest read of directional conviction.
+    std_term = float(np.std(terminal)) + 1e-9
+    favourable = terminal if direction > 0 else -terminal
+    weights = 1.0 + np.tanh(np.abs(favourable) / std_term)
+    weighted_win_rate = float(np.sum(weights * (favourable > 0)) / np.sum(weights))
+
+    n_batches = 8
+    batch_size = max(50, n_sims // n_batches)
+    batch_rates = []
+    for i in range(0, len(terminal) - batch_size + 1, batch_size):
+        chunk = terminal[i:i + batch_size]
+        batch_rates.append(np.mean(chunk > 0) if direction > 0 else np.mean(chunk < 0))
+    se = float(np.std(batch_rates)) if len(batch_rates) > 1 else 0.05
+
+    return 0.5 * sim_win_rate + 0.5 * weighted_win_rate, se
+
+
+def _mc_student_t_terminal(direction, mean_disp, vol, dur_ticks, returns, n_sims):
+    """Method 2 — fat-tailed terminal displacement. Synthetic-index returns
+    are close to Gaussian in the bulk but occasionally blow out (engineered
+    jumps); a pure Gaussian model understates the odds of a large adverse
+    move wiping out a thin edge. Degrees of freedom are fitted live from the
+    excess kurtosis of recent tick returns rather than fixed, so this
+    tightens toward Gaussian (high df) in calm regimes and widens (low df)
+    when the tape is actually showing fat tails right now."""
+    sample = np.asarray(returns[-200:]) if len(returns) >= 200 else np.asarray(returns)
+    if len(sample) >= 20 and np.std(sample) > 0:
+        z = (sample - np.mean(sample)) / np.std(sample)
+        kurt = float(np.mean(z ** 4))
+        excess_kurt = max(kurt - 3.0, 0.0)
+        df = float(np.clip(6.0 + 30.0 / (1.0 + excess_kurt), 4.0, 30.0))
+    else:
+        df = 8.0
+    # Scale a standard Student-t draw so its variance matches vol*sqrt(dur_ticks)
+    t_var_correction = np.sqrt(df / (df - 2)) if df > 2 else 1.0
+    t_scale = (vol * np.sqrt(dur_ticks)) / t_var_correction
+    draws = np.random.standard_t(df, size=n_sims) * t_scale + mean_disp * dur_ticks
+    return float(np.mean(draws > 0) if direction > 0 else np.mean(draws < 0))
+
+
+def _mc_jump_diffusion(direction, mean_disp, vol, dur_ticks, feats, returns, n_sims):
+    """Method 3 — Merton-style jump-diffusion overlay. Adds a compound-
+    Poisson jump component on top of the continuous Gaussian diffusion,
+    parameterised straight from the L18 jump-detection layer's own recent
+    intensity/direction reading (feats['jump_intensity'], feats['jump_dir'])
+    instead of re-deriving jump statistics from scratch. Vectorised via the
+    additive property of Gaussian sums (sum of k iid N(m, s^2) ~ N(k*m, k*s^2))
+    so this costs one extra np.random call, not a per-path Python loop."""
+    base = np.random.normal(mean_disp * dur_ticks, vol * np.sqrt(dur_ticks), size=n_sims)
+    jump_intensity = float(feats.get("jump_intensity", 0.0) or 0.0)
+    if jump_intensity <= 0:
+        return float(np.mean(base > 0) if direction > 0 else np.mean(base < 0))
+
+    jump_dir = float(feats.get("jump_dir", 0.0) or 0.0)
+    sample = np.asarray(returns[-200:]) if len(returns) >= 200 else np.asarray(returns)
+    sigma_r = float(np.std(sample)) if len(sample) > 1 else vol
+    jump_scale = max(sigma_r * 2.5, 1e-9)   # jumps are >2.5-sigma events by the detector's own definition
+
+    lam = jump_intensity * dur_ticks
+    n_jumps = np.random.poisson(lam, size=n_sims)
+    jump_mean = n_jumps * jump_dir * jump_scale
+    jump_std  = jump_scale * 0.3 * np.sqrt(n_jumps)
+    jump_shock = np.random.normal(0.0, np.maximum(jump_std, 1e-12))
+    terminal = base + jump_mean + jump_shock
+    return float(np.mean(terminal > 0) if direction > 0 else np.mean(terminal < 0))
+
+
+def _mc_regime_mixture(direction, drift, reversion_pull, vol, dur_ticks, trend_weight, n_sims):
+    """Method 5 — regime-mixture simulation. The original model pre-blended
+    trend drift and OU reversion pull into a single mean before sampling one
+    Gaussian — mathematically that just shifts a bell curve, it can't express
+    "either this is a trending tape OR a mean-reverting one, and I'm not sure
+    which." This version draws each simulated path's REGIME independently
+    (Bernoulli(trend_weight): trend-only drift vs. reversion-only pull), so
+    the resulting mixture can be bimodal when the two regimes disagree in
+    direction — genuinely different information than a single blended mean."""
+    is_trend = np.random.random(n_sims) < np.clip(trend_weight, 0.0, 1.0)
+    mean_disp = np.where(is_trend, drift, reversion_pull)
+    terminal = np.random.normal(mean_disp * dur_ticks, vol * np.sqrt(dur_ticks), size=n_sims)
+    return float(np.mean(terminal > 0) if direction > 0 else np.mean(terminal < 0))
+
+
+def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
+                         n_sims=MC_SIMULATIONS, models=None, tpm=None):
     """Takes the direction already decided by the Bayesian layer (does NOT
-    re-decide direction) and simulates forward paths to find which duration
-    maximizes expected win probability.
+    re-decide direction) and runs a 5-method Monte Carlo ensemble per
+    candidate duration to find which one maximizes expected win probability:
 
-    OU reversion pull weighted by (1 - trend_weight) - same weighting Bayesian
-    fusion used when deciding direction, so MC never silently fights the chosen
-    direction (fixed the exp_win=0.00 bug from earlier logs).
+      1. Gaussian terminal displacement   — original parametric model
+      2. Student-t terminal displacement  — fat tails, df fitted from live kurtosis
+      3. Block-bootstrap (model-free)     — resamples actual historical returns
+      4. Jump-diffusion overlay           — Merton-style, driven by the jump layer
+      5. Regime-mixture simulation        — trend vs. mean-reversion as a genuine
+                                             mixture rather than one blended mean
 
-    When deep startup calibration has produced empirical per-duration win rates,
-    those are blended with the simulation estimate (70% sim / 30% empirical) so
+    The five estimates are combined with MC_ENSEMBLE_WEIGHTS, then shrunk
+    toward 0.5 in proportion to how much the methods DISAGREE with each other
+    (ENSEMBLE_DISAGREEMENT_PENALTY) — a generalisation of the meta_ensemble_
+    agrees() 2-way check that previously existed but was never wired in.
+    OU reversion pull is still weighted by (1 - trend_weight), same weighting
+    Bayesian fusion used when deciding direction, so MC never silently fights
+    the chosen direction.
+
+    When deep startup calibration has produced empirical per-duration win
+    rates, those are Beta-shrunk (FIX v4) and blended with the ensemble
+    estimate (70% empirical / 30% ensemble once there's real sample size) so
     duration selection is anchored to what actually happened on this symbol.
 
-    CHANGED: candidate_durations is now in MINUTES (was ticks). `returns`/
-    `vol` are still per-TICK statistics, so each candidate is converted to an
-    equivalent tick count (dur_min * tpm) purely for the terminal-displacement
-    math below. Everything else (empirical bucket lookups, the returned best
-    duration) stays in minutes, matching CANDIDATE_DURATIONS."""
+    CHANGED (back to ticks): candidate_durations is once again in TICKS, not
+    minutes — Deriv's "t" duration_unit. `returns`/`vol` are already
+    per-TICK statistics, so each candidate is used directly as dur_ticks with
+    no ticks-per-minute conversion (`tpm` is accepted for backward
+    compatibility with existing call sites but is no longer used here)."""
     if len(returns) < 20:
         return candidate_durations[0], 0.5
-
-    tpm = tpm if tpm and tpm > 0 else TICKS_PER_MIN_DEFAULT
 
     cond_vol = feats.get("cond_vol")
     vol = cond_vol if cond_vol and cond_vol > 0 else (np.std(returns[-50:]) if len(returns) >= 50 else np.std(returns))
@@ -3392,60 +3554,47 @@ def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
     empirical = getattr(models, "empirical_duration_win_rates", {}) if models else {}
     empirical_counts = getattr(models, "empirical_duration_counts", {}) if models else {}
 
-    # ── Terminal displacement model ───────────────────────────────────────
-    # Deriv Rise/Fall settles on price[expiry] vs price[entry]. The correct
-    # model for the terminal displacement after `dur` independent ticks is:
-    #
-    #   X_T ~ N(drift * dur, vol * sqrt(dur))
-    #
-    # The old approach summed `dur` individual N(drift, vol) draws, which is
-    # mathematically identical to N(drift*dur, vol*sqrt(dur)) for the terminal
-    # value BUT it was computing wins as sum(steps)>0 rather than sampling from
-    # the correct terminal distribution — introducing a monotone duration bias
-    # where longer durations always won because drift accumulated faster than
-    # noise. Synthetic index RNG drift is effectively zero by design, so with
-    # drift≈0 all durations produce ~50% in simulation and the empirical 30%
-    # blend from deep calibration becomes the ONLY real differentiator.
+    sub_sims = min(n_sims, MC_ENSEMBLE_SUB_SIMULATIONS)
+    mean_disp = drift + reversion_pull
+
     best = None
-    for dur in candidate_durations:      # dur is in MINUTES
-        dur_ticks = dur * tpm            # convert to ticks for the vol/drift math
-        # Sample terminal displacement directly — no tick-by-tick accumulation
-        terminal = np.random.normal(
-            (drift + reversion_pull) * dur_ticks,   # expected drift over dur_ticks
-            vol * np.sqrt(dur_ticks),               # vol scales as sqrt(ticks)
-            size=n_sims
-        )
-        wins = np.sum(terminal > 0) if direction > 0 else np.sum(terminal < 0)
-        sim_win_rate = wins / n_sims
+    for dur in candidate_durations:      # dur is in TICKS
+        dur_ticks = dur
 
-        # FIX v2: Magnitude-weighted win rate.
-        # A naive win-count treats a path that ends barely past zero the same
-        # as one that ends far in favour of the direction. Borderline paths
-        # are weak evidence and inflate the apparent edge. Weighting by
-        # |terminal|/std down-weights borderline crossings and produces a
-        # sharper, more honest estimate of genuine directional conviction.
-        std_term = float(np.std(terminal)) + 1e-9
-        favourable = terminal if direction > 0 else -terminal
-        weights = 1.0 + np.tanh(np.abs(favourable) / std_term)
-        weighted_win_rate = float(
-            np.sum(weights * (favourable > 0)) / np.sum(weights)
-        )
+        gauss_est, gauss_se = _mc_gaussian_terminal(direction, mean_disp, vol, dur_ticks, n_sims)
+        student_t_est = _mc_student_t_terminal(direction, mean_disp, vol, dur_ticks, returns, sub_sims)
+        bootstrap_est = bootstrap_mc_p_directional(returns, direction, dur_ticks)
+        jump_est = _mc_jump_diffusion(direction, mean_disp, vol, dur_ticks, feats, returns, sub_sims)
+        regime_est = _mc_regime_mixture(direction, drift, reversion_pull, vol, dur_ticks, trend_weight, sub_sims)
 
-        # Blend: empirical (primary) + simulation win-rate (sim) + weighted overlay.
-        # Empirical still dominates at 70% when available; the remaining 30%
-        # is split between raw and magnitude-weighted simulation estimates.
-        sim_component = 0.5 * sim_win_rate + 0.5 * weighted_win_rate
+        ensemble = {
+            "gaussian":       gauss_est,
+            "student_t":      student_t_est,
+            "bootstrap":      bootstrap_est,
+            "jump_diffusion": jump_est,
+            "regime_mixture": regime_est,
+        }
+        ensemble_mean = sum(ensemble[k] * MC_ENSEMBLE_WEIGHTS[k] for k in ensemble)
+        disagreement = float(np.std(list(ensemble.values())))
+
+        # ENSEMBLE DISAGREEMENT PENALTY — see docstring/constant comment.
+        # gauss_se folds in too: a Gaussian estimate with a wide batch std
+        # error is itself less trustworthy, so it widens the effective
+        # disagreement rather than being ignored.
+        effective_spread = disagreement + 0.5 * gauss_se
+        trust = float(np.clip(1.0 - effective_spread * ENSEMBLE_DISAGREEMENT_PENALTY, 0.0, 1.0))
+        sim_component = 0.5 + (ensemble_mean - 0.5) * trust
 
         # FIX v4: Beta-shrinkage on the empirical duration win rate.
         # Root cause of the 13-for-13 losses at MC-reported P(win) >= 0.9:
         # empirical[dur] was a raw wins/total ratio with NO sample-size
         # awareness. Right after a recalibration a duration bucket with e.g.
         # 2 wins / 2 trades reads as 1.00 and, at 70% blend weight, drowns
-        # out the simulation's honest ~0.50-0.55 - the more "confident" the
+        # out the ensemble's honest ~0.50-0.55 - the more "confident" the
         # number looked, the less evidence actually backed it.
-        # Shrink toward the symbol's own simulated estimate (not a fixed
-        # 0.5) with strength EMPIRICAL_SHRINKAGE_PRIOR pseudo-observations:
-        # a handful of trades barely moves the estimate; a few hundred lets
+        # Shrink toward the symbol's own ensemble estimate (not a fixed 0.5)
+        # with strength EMPIRICAL_SHRINKAGE_PRIOR pseudo-observations: a
+        # handful of trades barely moves the estimate; a few hundred lets
         # the empirical rate dominate as intended.
         raw_emp = empirical.get(dur, 0.0)
         n_emp   = empirical_counts.get(dur, 0)
@@ -3464,6 +3613,12 @@ def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
             )
         else:
             blended = sim_component
+
+        vlog(f"[MC/Ensemble] dur={dur}t gauss={gauss_est:.3f}(se={gauss_se:.3f}) "
+              f"t={student_t_est:.3f} boot={bootstrap_est:.3f} jump={jump_est:.3f} "
+              f"regime={regime_est:.3f} disagree={disagreement:.3f} trust={trust:.2f} "
+              f"-> sim={sim_component:.3f} blended={blended:.3f}")
+
         if best is None or blended > best[1]:
             best = (dur, blended)
     return best
@@ -3989,7 +4144,7 @@ def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win
     print(sep)
     print(f"  Symbol  : {symbol}   Direction : {side}")
     print(f"  p(UP)   : {p_up:.4f}   Confidence: {confidence:.4f}   Score: {score:.4f}")
-    print(f"  Duration: {duration} minutes   MC exp. win rate: {exp_win:.2%}")
+    print(f"  Duration: {duration} ticks   MC exp. win rate: {exp_win:.2%}")
     print(f"  Trust   : vol={feats['vol_trust']:.2f}  entropy={feats['entropy_trust']:.2f}  "
           f"combined={feats['vol_trust']*feats['entropy_trust']:.2f}")
     print("\n  Market regime:")
@@ -4032,7 +4187,7 @@ def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
     print(f"\n{sep}")
     print(f"  TRADE SUMMARY  {ts}")
     print(sep)
-    print(f"  Symbol    : {symbol}   {side}   {duration} minutes")
+    print(f"  Symbol    : {symbol}   {side}   {duration} ticks")
     print(f"  Signal    : p_up={p_up:.4f}   confidence={confidence:.4f}")
     print(f"  Outcome   : {outcome}")
     print(f"  Steps used: {n_steps} / {MARTINGALE_MAX_STEPS + 1}")
@@ -4102,10 +4257,10 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
             )
         else:
             # ── Rise/Fall fallback ────────────────────────────────────────
-            # Durations are now specified in MINUTES ("m") rather than ticks
-            # ("t") — see CANDIDATE_DURATIONS.
+            # CHANGED (back): durations are specified in TICKS ("t") again
+            # rather than minutes ("m") — see CANDIDATE_DURATIONS.
             contract_id = await buy_contract(
-                client, symbol, direction, int(duration), "m", stake
+                client, symbol, direction, int(duration), "t", stake
             )
         # A contract_id means the broker actually accepted the order — from
         # this point on the stake is genuinely at risk, so this attempt
@@ -4317,12 +4472,12 @@ def expanding_window_walk_forward(sd, n_folds=5, horizons=None, step=3):
     empirical win rates, per-layer correlations, and models fitted on the
     complete dataset for live trading.
 
-    CHANGED: horizons (defaulting to CANDIDATE_DURATIONS) are now in MINUTES.
-    The underlying tick array is still indexed tick-by-tick, so each minute
-    horizon is converted to an equivalent tick offset via tpm for the actual
-    array lookups. per_duration_outcomes / the returned win-rate dict stay
-    keyed by the original MINUTE value so they line up with what
-    monte_carlo_duration() expects from CANDIDATE_DURATIONS."""
+    CHANGED (back): horizons (defaulting to CANDIDATE_DURATIONS) are once
+    again in TICKS, matching Deriv's "t" duration_unit and the underlying
+    tick array's own native indexing — so no tpm conversion is needed here
+    any more. per_duration_outcomes / the returned win-rate dict are keyed
+    directly by tick count, exactly what monte_carlo_duration() expects from
+    CANDIDATE_DURATIONS."""
     if horizons is None:
         horizons = CANDIDATE_DURATIONS
 
@@ -4330,8 +4485,7 @@ def expanding_window_walk_forward(sd, n_folds=5, horizons=None, step=3):
     if n_ticks < MIN_TICKS_FOR_FIT * 2 + 100:
         return None
 
-    tpm = _ticks_per_minute(sd)
-    horizon_ticks = {h: max(1, int(round(h * tpm))) for h in horizons}
+    horizon_ticks = {h: max(1, int(h)) for h in horizons}
     max_horizon_ticks = max(horizon_ticks.values())
 
     all_ticks = list(sd.ticks)
@@ -5088,7 +5242,7 @@ async def main():
 
             print(f"[Recovery] step={state.recovery_step} | {rec_sym} "
                   f"{'CALL (Rise)' if rec_dir > 0 else 'PUT (Fall)'} | "
-                  f"dur={rec_duration}m | P(win)={exp_win_rate:.3f} | "
+                  f"dur={rec_duration}t | P(win)={exp_win_rate:.3f} | "
                   f"stake={state.recovery_stake:.2f}")
 
             won, _, executed = await execute_single_step(
@@ -5237,7 +5391,7 @@ async def main():
                 models=state.model_cache.get(s), tpm=_ticks_per_minute(sd)
             )
             if exp_win < MIN_EXP_WIN_RATE:
-                vlog(f"[MC] {s} skipped — best duration={duration}m "
+                vlog(f"[MC] {s} skipped — best duration={duration}t "
                      f"exp_win={exp_win:.3f} < floor {MIN_EXP_WIN_RATE}")
                 continue
 
@@ -5279,7 +5433,7 @@ async def main():
 
             print(f"TRADE SIGNAL | {symbol} "
                   f"{'CALL (Rise)' if direction > 0 else 'PUT (Fall)'} | "
-                  f"dur={dur_sym}m | P(win)={exp_win_sym:.3f} | "
+                  f"dur={dur_sym}t | P(win)={exp_win_sym:.3f} | "
                   f"stake={base_stake:.2f}")
 
             state.open_positions[symbol] = {
