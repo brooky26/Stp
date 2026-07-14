@@ -375,6 +375,23 @@ GATE_SCHEMA_VERSION = 4
 MIN_LAYER_AGREE    = 8
 MAX_LAYER_DISAGREE = 5
 
+# ── Intelligence-guided gate relax (expansion of autotune) ────────────────
+# autotune_gates() (below) only reacts to REALIZED win rate over 50+
+# resolved step-0 trades — honest, but slow: if the gates are simply too
+# tight and starving the bot of entries altogether, win rate has nothing to
+# update on because there's nothing TO win or lose. This tracks the 18-layer
+# agreement telemetry on EVERY evaluated signal — passed or blocked — and
+# asks a different, faster question: are we blocking signals that were
+# genuinely close to their own bar (a too-strict gate), or ones nowhere near
+# it (the gate correctly doing its job)? Only the former should relax
+# anything, and it defers to autotune_gates()'s tightening whenever recent
+# win rate has actually been poor, so the two mechanisms reinforce rather
+# than fight each other.
+GATE_EVAL_LOG_MAXLEN     = 200
+BLOCK_CHECK_INTERVAL     = 40     # re-evaluate strictness every N signal evaluations
+BLOCK_RATE_RELAX_TRIGGER = 0.65   # relax only when >=65% of the recent window was blocked
+BLOCKED_NEAR_MISS_LAYERS = 2      # ...and the blocks averaged within this many layers of passing
+
 # FIX v2: Hard cap on total stake committed in one martingale sequence.
 # If the cumulative at-risk amount would exceed this fraction of balance,
 # abort the recovery rather than place the next step.
@@ -985,6 +1002,23 @@ class TradeState:
         self.seq_p_up      = 0.5
         self.seq_confidence= 0.0
         self.seq_duration  = 0
+
+        # ── Session-wide running ledger — EVERY executed trade, including
+        # martingale recovery steps (step>=1). Separate from step0_wins/
+        # step0_total above, which intentionally only track the fresh
+        # signal's own win rate. This is the honest "what did we actually
+        # do" total, and is what log_running_totals() reports after every
+        # resolved trade.
+        self.total_trades_all = 0
+        self.total_wins_all   = 0
+        self.total_losses_all = 0
+        self.total_pnl_all    = 0.0
+
+        # ── Intelligence-guided gate telemetry (see BLOCK_CHECK_INTERVAL
+        # block above) — rolling log of every layer-gate evaluation (passed
+        # or blocked) so intelligence_guided_gate_relax() can tell a too-
+        # strict gate apart from one correctly rejecting weak signals.
+        self.gate_eval_log = deque(maxlen=GATE_EVAL_LOG_MAXLEN)
 
 
 @dataclass
@@ -3393,6 +3427,104 @@ def autotune_gates(state):
 
 
 # ---------------------------------------------------------------------------
+# INTELLIGENCE-GUIDED GATE RELAX (expansion of autotune_gates above)
+# ---------------------------------------------------------------------------
+def record_gate_evaluation(state, symbol, passed, n_agree, n_disagree,
+                           min_agree, max_dis, confidence):
+    """Called on EVERY layer-gate evaluation in the main scan loop — pass or
+    block — so intelligence_guided_gate_relax() has telemetry from the
+    18-layer intelligence pipeline itself (agreement counts, the effective
+    regime-conditional bar, and fused confidence) rather than just a binary
+    pass/fail. Rate-limited internally: only re-evaluates gate strictness
+    every BLOCK_CHECK_INTERVAL evaluations."""
+    state.gate_eval_log.append({
+        "symbol": symbol, "passed": bool(passed),
+        "n_agree": n_agree, "n_disagree": n_disagree,
+        "min_agree": min_agree, "max_dis": max_dis,
+        "confidence": confidence,
+    })
+    if len(state.gate_eval_log) % BLOCK_CHECK_INTERVAL == 0:
+        intelligence_guided_gate_relax(state)
+
+
+def intelligence_guided_gate_relax(state):
+    """Relaxes MIN_LAYER_AGREE / MAX_LAYER_DISAGREE / MIN_EXP_WIN_RATE when
+    the INTELLIGENCE LAYER's own telemetry says the gate — not the edge — is
+    what's blocking trades. Two conditions must both hold over the last
+    BLOCK_CHECK_INTERVAL evaluations:
+
+      1. Block rate is high (>= BLOCK_RATE_RELAX_TRIGGER): most signals are
+         being rejected.
+      2. The blocked signals were NEAR MISSES: on average within
+         BLOCKED_NEAR_MISS_LAYERS layers of their own (regime-conditional)
+         threshold, with non-trivial fused confidence. This is what
+         distinguishes "the gate is choking off a genuinely decent signal
+         stream" from "the tape just isn't offering anything worth trading
+         right now" — the latter should NOT relax anything.
+
+    Always defers to autotune_gates()'s tightening: if realized step-0 win
+    rate has actually been poor (<0.46 over 30+ trades), a high block rate
+    is doing exactly what it should, so this function stands down rather
+    than fighting the win-rate-based tightening."""
+    global MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
+
+    log = state.gate_eval_log
+    if len(log) < BLOCK_CHECK_INTERVAL:
+        return
+    recent = list(log)[-BLOCK_CHECK_INTERVAL:]
+    blocked = [r for r in recent if not r["passed"]]
+    block_rate = len(blocked) / len(recent)
+
+    if block_rate < BLOCK_RATE_RELAX_TRIGGER:
+        vlog(f"[AutoTune/Intel] block_rate={block_rate:.0%} over last {len(recent)} "
+              f"evaluations — gates aren't the bottleneck right now.")
+        return
+
+    if not blocked:
+        return
+
+    # How close (in layer-count) were the blocked signals to passing THEIR
+    # OWN effective threshold — not the global default, since the bar shifts
+    # per-regime (FIX v3b).
+    near_miss_gap = float(np.mean([
+        max(r["min_agree"] - r["n_agree"], r["n_disagree"] - r["max_dis"], 0)
+        for r in blocked
+    ]))
+    avg_conf = float(np.mean([r["confidence"] for r in blocked]))
+
+    total_step0_trades = sum(state.step0_total.values())
+    if total_step0_trades >= 30:
+        wr = sum(state.step0_wins.values()) / max(total_step0_trades, 1)
+        if wr < 0.46:
+            vlog(f"[AutoTune/Intel] block_rate={block_rate:.0%} but step0 WR={wr:.3f} "
+                  f"< 0.46 over {total_step0_trades} trades — deferring to autotune_gates' "
+                  f"tightening, not relaxing.")
+            return
+
+    if near_miss_gap > BLOCKED_NEAR_MISS_LAYERS or avg_conf <= 0:
+        vlog(f"[AutoTune/Intel] block_rate={block_rate:.0%} but avg near-miss gap="
+              f"{near_miss_gap:.2f} layers (need <= {BLOCKED_NEAR_MISS_LAYERS}) / "
+              f"avg blocked confidence={avg_conf:.4f} — blocked signals are genuinely "
+              f"weak, not tightening artifacts. Gates unchanged.")
+        return
+
+    new_agree = max(MIN_LAYER_AGREE - 1, 7)
+    new_dis   = min(MAX_LAYER_DISAGREE + 1, 6)
+    new_mc    = max(MIN_EXP_WIN_RATE - 0.01, 0.50)
+    if (new_agree, new_dis, new_mc) == (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
+        return   # already at the relaxed floor — nothing left to loosen
+
+    MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
+    vlog(f"[AutoTune/Intel] {block_rate:.0%} of last {len(recent)} signals blocked, "
+          f"avg near-miss gap={near_miss_gap:.2f} layers, avg blocked confidence="
+          f"{avg_conf:.4f} → RELAXED: agree>={MIN_LAYER_AGREE} "
+          f"disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
+    if _store:
+        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
+
+
+# ---------------------------------------------------------------------------
 # LAYER 12: MONTE CARLO DURATION SELECTOR — 5-METHOD ENSEMBLE
 # ---------------------------------------------------------------------------
 # The functions below are the individual ensemble members that
@@ -3914,7 +4046,12 @@ def fuse_signal(features: dict, state: "TradeState",
 # LAYER AGREEMENT GATE
 # ---------------------------------------------------------------------------
 def passes_layer_gate(feats, direction):
-    """Returns (passes: bool, agree: int, disagree: int, neutral: int).
+    """Returns (passes: bool, agree: int, disagree: int, neutral: int,
+    min_agree: int, max_dis: int). The last two are the EFFECTIVE
+    regime-conditional thresholds actually applied to this evaluation (see
+    below) — returned so callers (e.g. record_gate_evaluation) can measure
+    how close a blocked signal came to passing ITS OWN bar, not the global
+    default, since the bar shifts per-regime.
 
     v3b: Regime-conditional thresholds.
     In a strong trending regime (high regime_strength) signals are plentiful
@@ -3945,7 +4082,7 @@ def passes_layer_gate(feats, direction):
         max_dis   = MAX_LAYER_DISAGREE
 
     passes = (agree >= min_agree) and (disagree <= max_dis)
-    return passes, agree, disagree, neutral
+    return passes, agree, disagree, neutral, min_agree, max_dis
 
 
 # ---------------------------------------------------------------------------
@@ -4171,6 +4308,23 @@ def log_trade(symbol, direction, stake, won, profit, step):
           f"won={won} profit={profit:+.2f}")
 
 
+def log_running_totals(state):
+    """One-line running ledger printed after EVERY resolved trade — any
+    step, including martingale recovery steps. This is intentionally the
+    one place that reports total activity: bot_trade_log's step0-derived
+    stats and Supabase step0_wins/step0_total both only track the fresh
+    signal's own win rate by design (see the comment on TradeState's
+    total_trades_all block), so neither on its own answers "how many trades
+    have we actually placed, and what did they net?" This does."""
+    t   = state.total_trades_all
+    w   = state.total_wins_all
+    l   = state.total_losses_all
+    pnl = state.total_pnl_all
+    wr  = (w / t) if t > 0 else 0.0
+    print(f"[Ledger] trades={t}  wins={w}  losses={l}  win_rate={wr:.1%}  "
+          f"net_P&L={pnl:+.2f}  balance={state.balance:.2f}")
+
+
 def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
                       balance_before, balance_after, p_up, confidence, duration):
     """Printed once after a full martingale sequence resolves (win or full loss).
@@ -4221,7 +4375,7 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
     # executed=False so callers can retry the SAME step at the SAME stake
     # instead of burning a recovery step on a phantom loss.
     if feats is not None:
-        gate_ok, n_agree, n_dis, _ = passes_layer_gate(feats, direction)
+        gate_ok, n_agree, n_dis, _, _, _ = passes_layer_gate(feats, direction)
         if not gate_ok:
             print(f"[Gate/Atomic] {symbol} step={step} blocked at execution — "
                   f"{n_agree} agree / {n_dis} disagree (gate moved between check and fire) "
@@ -4273,6 +4427,32 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
     except Exception as e:
         print(f"[Trade] Error on {symbol} step={step}: {e}")
 
+    # ── Running ledger + Supabase persistence for EVERY executed trade ──────
+    # FIX (expansion): previously both of these lived inside the `if step ==
+    # 0:` block below, so martingale recovery trades (step>=1) — real
+    # contracts with real money at risk — never showed up in bot_trade_log
+    # or any running total. They still don't feed the LEARNING systems
+    # (direction history, online layer weights, meta-learner, CUSUM,
+    # autotune) below, since those are intentionally step-0-only: a recovery
+    # trade is a forced pick to close out a sequence under a relaxed gate,
+    # not a fresh independent read of the signal, and feeding it back as one
+    # would bias what those systems learn. But it absolutely belongs in the
+    # audit trail and the totals.
+    if executed:
+        state.total_trades_all += 1
+        if won:
+            state.total_wins_all += 1
+        else:
+            state.total_losses_all += 1
+        state.total_pnl_all += profit
+        log_running_totals(state)
+
+        if _store is not None:
+            _store.save_trade(symbol, direction, step, stake, won, profit,
+                              state.seq_p_up, state.seq_confidence,
+                              state.seq_duration, feats,
+                              notouch_entry=state._last_notouch_entry)
+
     # accumulate into the sequence tracker for the summary log
     state.seq_stakes.append(stake)
     state.seq_profits.append(profit)
@@ -4316,13 +4496,6 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
                 state.drift_degraded[symbol] = True
                 vlog(f"[Drift/CUSUM] {symbol}: stake reduced to "
                       f"{DRIFT_STAKE_REDUCTION:.0%} until next recalibration")
-
-        # ── Persist trade to Supabase ───────────────────────────────────────
-        if _store is not None and feats is not None:
-            _store.save_trade(symbol, direction, step, stake, won, profit,
-                              state.seq_p_up, state.seq_confidence,
-                              state.seq_duration, feats,
-                              notouch_entry=state._last_notouch_entry)
 
         # ── Auto-tune gates every 50 step-0 trades ─────────────────────────
         state._trades_since_autotune += 1
@@ -5351,11 +5524,18 @@ async def main():
             direction = 1 if p_up > 0.5 else -1
 
             # Gate 1: Layer agreement (regime-conditional)
-            gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, direction)
+            gate_ok, n_agree, n_disagree, n_neutral, eff_min_agree, eff_max_dis = \
+                passes_layer_gate(feats, direction)
+
+            # Feed the intelligence-guided autotune with the outcome of THIS
+            # evaluation (pass or block) — see record_gate_evaluation().
+            record_gate_evaluation(state, s, gate_ok, n_agree, n_disagree,
+                                   eff_min_agree, eff_max_dis, float(confidence))
+
             if not gate_ok:
                 vlog(f"[Gate] {s} skipped — layer vote {n_agree} agree / "
                       f"{n_disagree} disagree / {n_neutral} neutral "
-                      f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
+                      f"(need >={eff_min_agree} agree, <={eff_max_dis} disagree)")
                 continue
 
             # Gate 2: Permutation entropy
